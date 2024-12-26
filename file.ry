@@ -1,0 +1,190 @@
+import logging
+import json
+from collections import defaultdict
+from telegram import Update, ParseMode
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    CallbackContext,
+    ConversationHandler
+)
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Состояния для разговора
+SELECTING_CHAT = range(1)
+
+class PhraseCounterBot:
+    def __init__(self, token: str):
+        # Структура для хранения фраз и счетчиков по чатам
+        # {chat_id: {phrase: count}}
+        self.phrase_counts = defaultdict(lambda: defaultdict(int))
+        # Отслеживаемые чаты
+        self.tracked_chats = set()
+        # Загрузка сохраненных данных
+        self.load_data()
+        
+        self.updater = Updater(token)
+        self.dispatcher = self.updater.dispatcher
+        self.setup_handlers()
+
+    def load_data(self):
+        """Загрузка данных из файла"""
+        try:
+            with open('phrase_data.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                self.phrase_counts = defaultdict(lambda: defaultdict(int))
+                for chat_id, phrases in data['counts'].items():
+                    self.phrase_counts[chat_id].update(phrases)
+                self.tracked_chats = set(data['tracked_chats'])
+        except FileNotFoundError:
+            logger.info("Файл с данными не найден, начинаем с пустого состояния")
+
+    def save_data(self):
+        """Сохранение данных в файл"""
+        with open('phrase_data.json', 'w', encoding='utf-8') as f:
+            json.dump({
+                'counts': {str(k): v for k, v in self.phrase_counts.items()},
+                'tracked_chats': list(self.tracked_chats)
+            }, f, ensure_ascii=False, indent=2)
+
+    def setup_handlers(self):
+        """Настройка обработчиков команд"""
+        self.dispatcher.add_handler(CommandHandler("start", self.start))
+        self.dispatcher.add_handler(CommandHandler("help", self.help))
+        self.dispatcher.add_handler(CommandHandler("add", self.add_phrase))
+        self.dispatcher.add_handler(CommandHandler("remove", self.remove_phrase))
+        self.dispatcher.add_handler(CommandHandler("list", self.list_phrases))
+        self.dispatcher.add_handler(CommandHandler("stats", self.show_stats))
+        self.dispatcher.add_handler(CommandHandler("track", self.track_chat))
+        self.dispatcher.add_handler(CommandHandler("untrack", self.untrack_chat))
+        self.dispatcher.add_handler(MessageHandler(
+            Filters.text & ~Filters.command,
+            self.count_phrases
+        ))
+
+    def start(self, update: Update, context: CallbackContext) -> None:
+        """Начало работы с ботом"""
+        update.message.reply_text(
+            'Привет! Я бот для подсчета фраз в чатах.\n\n'
+            'Основные команды:\n'
+            '/add <фраза> - добавить фразу для отслеживания\n'
+            '/remove <фраза> - удалить фразу\n'
+            '/list - показать отслеживаемые фразы\n'
+            '/stats - показать статистику\n'
+            '/track - начать отслеживание в текущем чате\n'
+            '/untrack - прекратить отслеживание\n'
+            '/help - показать эту справку'
+        )
+
+    def help(self, update: Update, context: CallbackContext) -> None:
+        """Показать справку"""
+        self.start(update, context)
+
+    def add_phrase(self, update: Update, context: CallbackContext) -> None:
+        """Добавление фразы для отслеживания"""
+        chat_id = update.effective_chat.id
+        if not context.args:
+            update.message.reply_text('Использование: /add <фраза>')
+            return
+
+        phrase = ' '.join(context.args)
+        self.phrase_counts[str(chat_id)][phrase] = 0
+        self.save_data()
+        update.message.reply_text(f'Фраза "{phrase}" добавлена для отслеживания')
+
+    def remove_phrase(self, update: Update, context: CallbackContext) -> None:
+        """Удаление фразы из отслеживания"""
+        chat_id = update.effective_chat.id
+        if not context.args:
+            update.message.reply_text('Использование: /remove <фраза>')
+            return
+
+        phrase = ' '.join(context.args)
+        if phrase in self.phrase_counts[str(chat_id)]:
+            del self.phrase_counts[str(chat_id)][phrase]
+            self.save_data()
+            update.message.reply_text(f'Фраза "{phrase}" удалена')
+        else:
+            update.message.reply_text('Такая фраза не отслеживается')
+
+    def list_phrases(self, update: Update, context: CallbackContext) -> None:
+        """Показать список отслеживаемых фраз"""
+        chat_id = str(update.effective_chat.id)
+        phrases = list(self.phrase_counts[chat_id].keys())
+        
+        if not phrases:
+            update.message.reply_text('Нет отслеживаемых фраз')
+            return
+
+        message = "Отслеживаемые фразы:\n" + "\n".join(
+            f"- {phrase}" for phrase in phrases
+        )
+        update.message.reply_text(message)
+
+    def show_stats(self, update: Update, context: CallbackContext) -> None:
+        """Показать статистику использования фраз"""
+        chat_id = str(update.effective_chat.id)
+        counts = self.phrase_counts[chat_id]
+        
+        if not counts:
+            update.message.reply_text('Нет статистики')
+            return
+
+        message = "Статистика употребления фраз:\n" + "\n".join(
+            f'"{phrase}": {count} раз' 
+            for phrase, count in sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        )
+        update.message.reply_text(message)
+
+    def track_chat(self, update: Update, context: CallbackContext) -> None:
+        """Начать отслеживание в чате"""
+        chat_id = update.effective_chat.id
+        self.tracked_chats.add(str(chat_id))
+        self.save_data()
+        update.message.reply_text('Отслеживание фраз включено в этом чате')
+
+    def untrack_chat(self, update: Update, context: CallbackContext) -> None:
+        """Прекратить отслеживание в чате"""
+        chat_id = str(update.effective_chat.id)
+        if chat_id in self.tracked_chats:
+            self.tracked_chats.remove(chat_id)
+            self.save_data()
+            update.message.reply_text('Отслеживание фраз выключено в этом чате')
+        else:
+            update.message.reply_text('Отслеживание уже выключено')
+
+    def count_phrases(self, update: Update, context: CallbackContext) -> None:
+        """Подсчет фраз в сообщениях"""
+        chat_id = str(update.effective_chat.id)
+        if chat_id not in self.tracked_chats:
+            return
+
+        message_text = update.message.text.lower()
+        changed = False
+        
+        for phrase in self.phrase_counts[chat_id]:
+            count = message_text.count(phrase.lower())
+            if count > 0:
+                self.phrase_counts[chat_id][phrase] += count
+                changed = True
+
+        if changed:
+            self.save_data()
+
+    def run(self):
+        """Запуск бота"""
+        self.updater.start_polling()
+        self.updater.idle()
+
+if __name__ == '__main__':
+    # Замените на свой токен
+    bot = PhraseCounterBot("ВАШ_ТОКЕН_БОТА")
+    bot.run()
